@@ -26,6 +26,26 @@ EXHAUSTIVE_DISTS = ["0C:1N", "N:CA", "CA:C"]
 MINIMAL_ANGLES = ["phi", "psi", "omega"]
 MINIMAL_DISTS = []
 
+seq_order = ['T', 'S', 'A', 'G', 'P', 'R', 'K', 'N', 'D', 'E', 'Q', 'H', 'Y', 'W', 'F', 'L', 'M', 'I', 'V', 'C']
+seq2angle = {aa:angle for aa, angle in zip(seq_order, (np.linspace(-np.pi, np.pi, 20, endpoint=False)+np.pi/20))}
+standard_aa = set("ACDEFGHIKLMNPQRSTVWY")|set(["MSE"])
+def sequence_wrapper(fname: str):
+    try:
+        opener = gzip.open if fname.endswith(".gz") else open
+        with opener(str(fname), "rt") as f:
+            source= PDBFile.read(f)
+        if source.get_model_count() > 1:
+            return None
+        source_struct = source.get_structure()[0]
+        seq = [ProteinSequence.convert_letter_3to1(x.res_name) for x in source_struct if x.atom_name=="CA"]
+        if len(set(seq)-standard_aa)>0:
+            logging.warning(f"{fname} non standard aminoacids, skipping")
+            return None
+        seq = np.array([seq2angle[x] if (x!="MSE") else seq2angle["M"] for x in seq])
+        return seq
+    except Exception as e:
+        logging.warning(f"{fname} sequence extraction failed: {e}")
+        return None
 
 def canonical_distances_and_dihedrals(
     fname: str,

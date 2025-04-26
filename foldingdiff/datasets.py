@@ -35,6 +35,7 @@ from foldingdiff.angles_and_coords import (
     EXHAUSTIVE_ANGLES,
     EXHAUSTIVE_DISTS,
     extract_backbone_coords,
+    sequence_wrapper
 )
 from foldingdiff import custom_metrics as cm
 from foldingdiff import utils
@@ -70,6 +71,434 @@ FEATURE_SET_NAMES_TO_FEATURE_NAMES = {
     "canonical-minimal-angles": ["phi", "psi", "omega", "tau"],
     "cart-coords": ["x", "y", "z"],
 }
+
+
+class CathCanonicalAnglesSequenceDataset(Dataset):
+    """
+    Load in the dataset.
+
+    All angles should be given between [-pi, pi]
+    """
+
+    feature_names = {
+        "angles": [
+            "0C:1N",
+            "N:CA",
+            "CA:C",
+            "phi",
+            "psi",
+            "omega",
+            "tau",
+            "CA:C:1N",
+            "C:1N:1CA",
+        ],
+        "coords": ["x", "y", "z"],
+        "sequence":["sequence"],
+    }
+    feature_is_angular = {
+        "angles": [False, False, False, True, True, True, True, True, True],
+        "coords": [False, False, False],
+        "sequence":[True]
+    }
+
+    def __init__(
+        self,
+        pdbs: Union[
+            Literal["cath", "alphafold"], str
+        ] = "cath",  # Keyword or a directory
+        split: Optional[Literal["train", "test", "validation"]] = None,
+        pad: int = 512,
+        min_length: int = 40,  # Set to 0 to disable
+        trim_strategy: TRIM_STRATEGIES = "leftalign",
+        toy: int = 0,
+        zero_center: bool = True,  # Center the features to have 0 mean
+        use_cache: bool = True,  # Use/build cached computations of dihedrals and angles
+        cache_dir: Path = Path(os.path.dirname(os.path.abspath(__file__))),
+    ) -> None:
+        super().__init__()
+        assert pad > min_length
+        self.trim_strategy = trim_strategy
+        self.pad = pad
+        self.min_length = min_length
+
+        # gather files
+        self.pdbs_src = pdbs
+        fnames = self.__get_pdb_fnames(pdbs)
+        self.fnames = fnames
+
+        # self.structures should be a list of dicts with keys (angles, coords, fname)
+        # Define as None by default; allow for easy checking later
+        self.structures = None
+        codebase_hash = utils.md5_all_py_files(
+            os.path.dirname(os.path.abspath(__file__))
+        )
+        # Default to false; assuming no cache, also doesn't match
+        codebase_matches_hash = False
+        self.use_cache = use_cache
+        self.cache_dir = cache_dir
+        # Always compute for toy; do not save
+        if toy:
+            if isinstance(toy, bool):
+                toy = 150
+            fnames = fnames[:toy]
+
+            logging.info(f"Loading toy dataset of {toy} structures")
+            self.structures = self.__compute_featurization(fnames)
+        elif use_cache and os.path.exists(self.cache_fname):
+            logging.info(f"Loading cached full dataset from {self.cache_fname}")
+            with open(self.cache_fname, "rb") as source:
+                loaded_hash, loaded_structures = pickle.load(source)
+                codebase_matches_hash = loaded_hash == codebase_hash
+                if not all("sequence" in s for s in loaded_structures):
+                    logging.warning("Old cache does not have sequence information, regenerating...")
+                    self.structures = None
+                elif not codebase_matches_hash:
+                    logging.warning("Mismatched hashes between codebase and cached values; updating cached values")
+                else:
+                    self.structures = loaded_structures
+                    logging.info("Hash matches between codebase and cached values!")
+        # We have not yet populated self.structures
+        if self.structures is None:
+            self.__clean_mismatched_caches()
+            self.structures = self.__compute_featurization(fnames)
+            if use_cache and not codebase_matches_hash:
+                logging.info(f"Saving full dataset to cache at {self.cache_fname}")
+                with open(self.cache_fname, "wb") as sink:
+                    pickle.dump((codebase_hash, self.structures), sink)
+
+        # If specified, remove sequences shorter than min_length
+        if self.min_length:
+            orig_len = len(self.structures)
+            self.structures = [
+                s for s in self.structures if s["angles"].shape[0] >= self.min_length
+            ]
+            len_delta = orig_len - len(self.structures)
+            logging.info(
+                f"Removing structures shorter than {self.min_length} residues excludes {len_delta}/{orig_len} --> {len(self.structures)} sequences"
+            )
+        if self.trim_strategy == "discard":
+            orig_len = len(self.structures)
+            self.structures = [
+                s for s in self.structures if s["angles"].shape[0] <= self.pad
+            ]
+            len_delta = orig_len - len(self.structures)
+            logging.info(
+                f"Removing structures longer than {self.pad} produces {orig_len} - {len_delta} = {len(self.structures)} sequences"
+            )
+
+        # Split the dataset if requested. This is implemented here to maintain
+        # functional parity with the original CATH dataset. Original CATH uses
+        # a 80/10/10 split
+        self.rng = np.random.default_rng(seed=6489)
+        # Shuffle the sequences so contiguous splits acts like random splits
+        self.rng.shuffle(self.structures)
+        if split is not None:
+            split_idx = int(len(self.structures) * 0.8)
+            if split == "train":
+                self.structures = self.structures[:split_idx]
+            elif split == "validation":
+                self.structures = self.structures[
+                    split_idx : split_idx + int(len(self.structures) * 0.1)
+                ]
+            elif split == "test":
+                self.structures = self.structures[
+                    split_idx + int(len(self.structures) * 0.1) :
+                ]
+            else:
+                raise ValueError(f"Unknown split: {split}")
+
+            logging.info(f"Split {split} contains {len(self.structures)} structures")
+
+        # if given, zero center the features
+        self.means = None
+        if zero_center:
+            # Note that these angles are not yet padded
+            structures_concat = np.concatenate([s["angles"] for s in self.structures])
+            assert structures_concat.ndim == 2
+            self.means = cm.wrapped_mean(structures_concat, axis=0)
+            assert self.means.shape == (structures_concat.shape[1],)
+            # Subtract the mean and perform modulo where values are radial
+            logging.info(
+                f"Offsetting features {self.feature_names['angles']} by means {self.means}"
+            )
+
+        # Aggregate lengths
+        self.all_lengths = [s["angles"].shape[0] for s in self.structures]
+        self._length_rng = np.random.default_rng(seed=6489)
+        logging.info(
+            f"Length of angles: {np.min(self.all_lengths)}-{np.max(self.all_lengths)}, mean {np.mean(self.all_lengths)}"
+        )
+
+        # for ft in self.feature_names["angles"]:
+        #     idx = self.feature_names["angles"].index(ft)
+        #     is_angular = self.feature_is_angular["angles"][idx]
+        #     logging.info(f"Feature {ft} is angular: {is_angular}")
+        #     m, v = self.get_feature_mean_var(ft)
+        #     logging.info(f"Feature {ft} mean, var: {m}, {v}")
+
+    def __get_pdb_fnames(
+        self, pdbs: Union[Literal["cath", "alphafold"], str, List[str], Tuple[str]]
+    ) -> List[str]:
+        """Return a list of filenames for PDB structures making up this dataset"""
+        if isinstance(pdbs, (list, tuple)):
+            # A list of PDBs
+            for f in pdbs:
+                assert os.path.isfile(f), f"Given file does not exist: {f}"
+            fnames = pdbs
+            logging.info(f"Given {len(fnames)} PDB files")
+        elif Path(pdbs).is_dir():
+            fnames = []
+            for ext in [".pdb", ".pdb.gz"]:
+                fnames.extend(glob.glob(os.path.join(pdbs, f"*{ext}")))
+            assert fnames, f"No PDB files found in {pdbs}"
+            logging.info(f"Found {len(fnames)} PDB files in {pdbs}")
+        else:  # Should be a keyword
+            if pdbs == "cath":
+                fnames = glob.glob(os.path.join(CATH_DIR, "dompdb", "*"))
+                assert fnames, f"No files found in {CATH_DIR}/dompdb"
+            elif pdbs == "alphafold":
+                fnames = glob.glob(os.path.join(ALPHAFOLD_DIR, "*.pdb.gz"))
+                assert fnames, f"No files found in {ALPHAFOLD_DIR}"
+            else:
+                raise ValueError(f"Unknown pdb set: {pdbs}")
+
+        return fnames
+
+    @property
+    def cache_fname(self) -> str:
+        """Return the filename for the cache file"""
+        if os.path.isdir(self.pdbs_src):
+            k = os.path.basename(self.pdbs_src)
+        else:
+            k = self.pdbs_src
+
+        # Create md5 of all the filenames (NOT their contents)
+        hash_md5 = hashlib.md5()
+        for fname in self.fnames:
+            hash_md5.update(os.path.basename(fname).encode())
+        filename_hash = hash_md5.hexdigest()
+
+        return os.path.join(
+            self.cache_dir, f"cache_canonical_structures_{k}_{filename_hash}.pkl"
+        )
+
+    def __clean_mismatched_caches(self) -> None:
+        """Clean out mismatched cache files"""
+        if not self.use_cache:
+            logging.info("Not using cache -- skipping cache cleaning")
+            return
+
+        if os.path.isdir(self.pdbs_src):
+            k = os.path.basename(self.pdbs_src)
+        else:
+            k = self.pdbs_src
+
+        matches = glob.glob(
+            os.path.join(self.cache_dir, f"cache_canonical_structures_{k}_*.pkl")
+        )
+        if not matches:
+            logging.info(
+                f"No cache files found matching {matches}, no cleaning necessary"
+            )
+        for fname in matches:
+            if fname != self.cache_fname:
+                logging.info(f"Removing old cache file {fname}")
+                os.remove(fname)
+
+    def __compute_featurization(
+        self, fnames: Sequence[str]
+    ) -> List[Dict[str, np.ndarray]]:
+        """Get the featurization of the given fnames"""
+        pfunc = functools.partial(
+            canonical_distances_and_dihedrals,
+            distances=EXHAUSTIVE_DISTS,
+            angles=EXHAUSTIVE_ANGLES,
+        )
+        coords_pfunc = functools.partial(extract_backbone_coords, atoms=["CA"])
+
+        sequence_pfunc = functools.partial(sequence_wrapper)
+
+        logging.info(
+            f"Computing full dataset of {len(fnames)} with {multiprocessing.cpu_count()} threads"
+        )
+        # Generate dihedral angles
+        pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+        struct_arrays = list(pool.map(pfunc, fnames, chunksize=250))
+        coord_arrays = list(pool.map(coords_pfunc, fnames, chunksize=250))
+        sequence_arrays = list(pool.map(sequence_pfunc, fnames, chunksize=250))
+        pool.close()
+        pool.join()
+        # Contains only non-null structures
+        structures = []
+        for fname, s, c, seq in zip(fnames, struct_arrays, coord_arrays, sequence_arrays):
+            if (s is None)|(seq is None):
+                continue
+            if (len(seq)==s.shape[0]==c.shape[0]):
+                structures.append(
+                    {
+                        "angles": s,
+                        "coords": c,
+                        "fname": fname,
+                        "sequence":seq
+                    }
+                )
+        return structures
+
+    def sample_length(self, n: int = 1) -> Union[int, List[int]]:
+        """
+        Sample a observed length of a sequence
+        """
+        assert n > 0
+        if n == 1:
+            l = self._length_rng.choice(self.all_lengths)
+        else:
+            l = self._length_rng.choice(self.all_lengths, size=n, replace=True).tolist()
+        return l
+
+    def get_masked_means(self) -> np.ndarray:
+        """Return the means subset to the actual features used"""
+        if self.means is None:
+            return None
+        return np.copy(self.means)
+
+    @functools.cached_property
+    def filenames(self) -> List[str]:
+        """Return the filenames that constitute this dataset"""
+        return [s["fname"] for s in self.structures]
+
+    def __len__(self) -> int:
+        return len(self.structures)
+
+    def __getitem__(
+        self, index, ignore_zero_center: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        if not 0 <= index < len(self):
+            raise IndexError("Index out of range")
+
+        angles = self.structures[index]["angles"]
+        # NOTE coords are NOT shifted or wrapped, has same length as angles
+        coords = self.structures[index]["coords"]
+        sequence = self.structures[index]["sequence"]
+
+        assert angles.shape[0] == coords.shape[0] == sequence.shape[0]
+
+        # If given, offset the angles with mean
+        if self.means is not None and not ignore_zero_center:
+            assert (
+                self.means.shape[0] == angles.shape[1]
+            ), f"Mismatched shapes for mean offset: {self.means.shape} != {angles.shape}"
+            angles = angles - self.means
+
+            # The distance features all contain a single ":"
+            colon_count = np.array([c.count(":") for c in angles.columns])
+            # WARNING this uses a very hacky way to find the angles
+            angular_idx = np.where(colon_count != 1)[0]
+            angles.iloc[:, angular_idx] = utils.modulo_with_wrapped_range(
+                angles.iloc[:, angular_idx], -np.pi, np.pi
+            )
+
+        # Subset angles to ones we are actaully using as features
+        angles = angles.loc[
+            :, CathCanonicalAnglesSequenceDataset.feature_names["angles"]
+        ].values
+        assert angles is not None
+        assert angles.shape[1] == len(
+            CathCanonicalAnglesSequenceDataset.feature_is_angular["angles"]
+        ), f"Mismatched shapes for angles: {angles.shape[1]} != {len(CathCanonicalAnglesSequenceDataset.feature_is_angular['angles'])}"
+
+        # Replace nan values with zero
+        np.nan_to_num(angles, copy=False, nan=0)
+
+        # Create attention mask. 0 indicates masked
+        l = min(self.pad, angles.shape[0])
+        attn_mask = torch.zeros(size=(self.pad,))
+        attn_mask[:l] = 1.0
+
+        # Additionally, mask out positions that are nan
+        # is_nan = np.where(np.any(np.isnan(angles), axis=1))[0]
+        # attn_mask[is_nan] = 0.0  # Mask out the nan positions
+
+        # Perform padding/trimming
+        if angles.shape[0] < self.pad:
+            angles = np.pad(
+                angles,
+                ((0, self.pad - angles.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+            coords = np.pad(
+                coords,
+                ((0, self.pad - coords.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+            sequence = np.pad(
+            np.vstack([sequence]).T,
+            ((0, 512 - np.vstack([sequence]).T.shape[0]), (0, 0)),
+            mode="constant",
+            constant_values=0,
+            ).T[0]
+        elif angles.shape[0] > self.pad:
+            if self.trim_strategy == "leftalign":
+                angles = angles[: self.pad]
+                coords = coords[: self.pad]
+                sequence = sequence[: self.pad]
+            elif self.trim_strategy == "randomcrop":
+                # Randomly crop the sequence to
+                start_idx = self.rng.integers(0, angles.shape[0] - self.pad)
+                end_idx = start_idx + self.pad
+                assert end_idx < angles.shape[0]
+                angles = angles[start_idx:end_idx]
+                coords = coords[start_idx:end_idx]
+                sequence = sequence[start_idx:end_idx]
+                assert angles.shape[0] == coords.shape[0] == self.pad == sequence.shape[0]
+            else:
+                raise ValueError(f"Unknown trim strategy: {self.trim_strategy}")
+
+        # Create position IDs
+        position_ids = torch.arange(start=0, end=self.pad, step=1, dtype=torch.long)
+
+        angular_idx = np.where(CathCanonicalAnglesSequenceDataset.feature_is_angular["angles"])[
+            0
+        ]
+        assert utils.tolerant_comparison_check(
+            angles[:, angular_idx], ">=", -np.pi
+        ), f"Illegal value: {np.min(angles[:, angular_idx])}"
+        assert utils.tolerant_comparison_check(
+            angles[:, angular_idx], "<=", np.pi
+        ), f"Illegal value: {np.max(angles[:, angular_idx])}"
+        angles = torch.from_numpy(angles).float()
+        coords = torch.from_numpy(coords).float()
+        sequence = torch.from_numpy(sequence).float()
+
+        retval = {
+            "angles": angles,
+            "coords": coords,
+            "sequence":sequence,
+            "attn_mask": attn_mask,
+            "position_ids": position_ids,
+            "lengths": torch.tensor(l, dtype=torch.int64),
+        }
+        return retval
+
+    def get_feature_mean_var(self, ft_name: str) -> Tuple[float, float]:
+        """
+        Return the mean and variance associated with a given feature
+        """
+        assert ft_name in self.feature_names["angles"], f"Unknown feature {ft_name}"
+        idx = self.feature_names["angles"].index(ft_name)
+        logging.info(f"Computing metrics for {ft_name} - idx {idx}")
+
+        all_vals = []
+        for i in range(len(self)):
+            item = self[i]
+            attn_idx = torch.where(item["attn_mask"] == 1.0)[0]
+            vals = item["angles"][attn_idx, idx]
+            all_vals.append(vals)
+        all_vals = torch.cat(all_vals)
+        assert all_vals.ndim == 1
+        return torch.var_mean(all_vals)[::-1]  # Default is (var, mean)
+
 
 
 class CathCanonicalAnglesDataset(Dataset):
