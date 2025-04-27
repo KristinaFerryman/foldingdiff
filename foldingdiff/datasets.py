@@ -121,6 +121,9 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
         self.pad = pad
         self.min_length = min_length
 
+        self.feature_names = self.__class__.feature_names
+        self.feature_is_angular = self.__class__.feature_is_angular
+
         # gather files
         self.pdbs_src = pdbs
         fnames = self.__get_pdb_fnames(pdbs)
@@ -235,6 +238,14 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
         #     logging.info(f"Feature {ft} is angular: {is_angular}")
         #     m, v = self.get_feature_mean_var(ft)
         #     logging.info(f"Feature {ft} mean, var: {m}, {v}")
+
+        ## trim non-angle features
+        self.feature_idx={}
+        for key in ['angles', 'sequence']:
+            self.feature_idx[key] = [
+                i for i, x in enumerate(self.feature_is_angular[key]) if x
+            ]
+
 
     def __get_pdb_fnames(
         self, pdbs: Union[Literal["cath", "alphafold"], str, List[str], Tuple[str]]
@@ -359,7 +370,15 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
         """Return the means subset to the actual features used"""
         if self.means is None:
             return None
-        return np.copy(self.means)
+        # return np.copy(self.means)
+        return np.copy(self.means[self.feature_idx['angles']])
+    
+    def set_masked_means(self, mean_values: np.ndarray) -> None:
+        """Set the means to the subset of features used"""
+        if self.means is None:
+            raise NotImplementedError
+        logging.info(f"Setting means for features {self.feature_idx['angles']} <- {mean_values}")
+        self.means[self.feature_idx['angles']] = mean_values.copy()
 
     @functools.cached_property
     def filenames(self) -> List[str]:
@@ -434,7 +453,7 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
             )
             sequence = np.pad(
             np.vstack([sequence]).T,
-            ((0, 512 - np.vstack([sequence]).T.shape[0]), (0, 0)),
+            ((0, self.pad - np.vstack([sequence]).T.shape[0]), (0, 0)),
             mode="constant",
             constant_values=0,
             ).T[0]
@@ -479,6 +498,18 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
             "position_ids": position_ids,
             "lengths": torch.tensor(l, dtype=torch.int64),
         }
+
+        # Remove the distance feature
+        assert retval["angles"].ndim == 2
+        retval["angles"] = retval["angles"][:, self.feature_idx['angles']]
+        assert torch.all(
+            retval["angles"] >= -torch.pi
+        ), f"Minimum value {torch.min(retval['angles'])} lower than -pi"
+        assert torch.all(
+            retval["angles"] <= torch.pi
+        ), f"Maximum value {torch.max(retval['angles'])} higher than pi"
+        # return_dict.pop("coords", None)
+
         return retval
 
     def get_feature_mean_var(self, ft_name: str) -> Tuple[float, float]:
@@ -1124,7 +1155,8 @@ class NoisedAnglesDataset(Dataset):
     def __init__(
         self,
         dset: Dataset,
-        dset_key: str = "angles",
+        # dset_key: str = "angles",
+        dset_key: Union[str, List[str]] = ["angles","sequence"],
         timesteps: int = 250,
         exhaustive_t: bool = False,
         beta_schedule: beta_schedules.SCHEDULES = "linear",
@@ -1135,11 +1167,21 @@ class NoisedAnglesDataset(Dataset):
         self.dset = dset
         assert hasattr(dset, "feature_names")
         assert hasattr(dset, "feature_is_angular")
-        self.dset_key = dset_key
-        assert (
-            dset_key in dset.feature_is_angular
-        ), f"{dset_key} not in {dset.feature_is_angular}"
-        self.n_features = len(dset.feature_is_angular[dset_key])
+        # self.dset_key = dset_key
+        if isinstance(dset_key, str):
+            self.dset_key = [dset_key]
+        else:
+            self.dset_key = dset_key
+        # assert (
+        #     dset_key in dset.feature_is_angular
+        # ), f"{dset_key} not in {dset.feature_is_angular}"
+        for key in self.dset_key:
+            assert (
+                key in dset.feature_is_angular
+            ), f"{key} not in {dset.feature_is_angular}"
+
+        # self.n_features = len(dset.feature_is_angular[dset_key])
+        self.n_features = sum(len(dset.feature_is_angular[key]) for key in self.dset_key)
 
         self.nonangular_var_scale = nonangular_variance
         self.angular_var_scale = angular_variance
@@ -1211,19 +1253,33 @@ class NoisedAnglesDataset(Dataset):
 
         # Scale by provided variance scales based on angular or not
         if self.angular_var_scale != 1.0 or self.nonangular_var_scale != 1.0:
-            for j in range(noise.shape[-1]):  # Last dim = feature dim
-                s = (
-                    self.angular_var_scale
-                    if self.dset.feature_is_angular[self.dset_key][j]
-                    else self.nonangular_var_scale
-                )
-                noise[..., j] *= s
+            offset = 0
+            for key in self.dset_key:
+                angular_flags = self.dset.feature_is_angular[key]
+                # for j in range(noise.shape[-1]):  # Last dim = feature dim
+                for j, is_angular in enumerate(angular_flags):
+                    s = (
+                        self.angular_var_scale
+                        # if self.dset.feature_is_angular[self.dset_key][j]
+                        if is_angular
+                        else self.nonangular_var_scale
+                    )
+                # noise[..., j] *= s
+                noise[..., offset + j] *= s
+            offset += len(angular_flags)
 
         # Make sure that the noise doesn't run over the boundaries
-        angular_idx = np.where(self.dset.feature_is_angular[self.dset_key])[0]
-        noise[..., angular_idx] = utils.modulo_with_wrapped_range(
-            noise[..., angular_idx], -np.pi, np.pi
-        )
+        # angular_idx = np.where(self.dset.feature_is_angular[self.dset_key])[0]
+        # noise[..., angular_idx] = utils.modulo_with_wrapped_range(
+        #     noise[..., angular_idx], -np.pi, np.pi
+        # )
+        ## Assume all the features are used
+        angular_idx = np.arange(noise.shape[-1])
+
+        if len(angular_idx) > 0:
+            noise[..., angular_idx] = utils.modulo_with_wrapped_range(
+                noise[..., angular_idx], -np.pi, np.pi
+            )
 
         return noise
 
@@ -1258,7 +1314,10 @@ class NoisedAnglesDataset(Dataset):
         # If wrapped dset returns a dictionary then we extract the item to noise
         if self.dset_key is not None:
             assert isinstance(item, dict)
-            vals = item[self.dset_key].clone()
+            # vals = item[self.dset_key].clone()
+            vals_list = [item[key].clone() for key in self.dset_key]
+            vals_list = [val.unsqueeze(1) if len(val.shape)==1 else val for val in vals_list]  # expand sequence dimension
+            vals = torch.cat(vals_list, dim=-1)  # concatenate angles and sequences -> (512,7)
         else:
             vals = item.clone()
         assert isinstance(
@@ -1284,7 +1343,7 @@ class NoisedAnglesDataset(Dataset):
         ][t.item()]
         # Noise is sampled within range of [-pi, pi], and optionally
         # shifted to [0, 2pi] by adding pi
-        noise = self.sample_noise(vals)  # Vals passed in only for shape
+        noise = self.sample_noise(vals)  # Vals passed in only for shape    # noise has the same shape as vals -> (512, 10)
 
         # Add noise and ensure noised vals are still in range
         noised_vals = (
@@ -1293,11 +1352,17 @@ class NoisedAnglesDataset(Dataset):
         assert noised_vals.shape == vals.shape, f"Unexpected shape {noised_vals.shape}"
         # The underlying vals are already shifted, and noise is already shifted
         # All we need to do is ensure we stay on the corresponding manifold
-        angular_idx = np.where(self.dset.feature_is_angular[self.dset_key])[0]
-        # Wrap around the correct range
-        noised_vals[:, angular_idx] = utils.modulo_with_wrapped_range(
-            noised_vals[:, angular_idx], -np.pi, np.pi
-        )
+        # angular_idx = np.where(self.dset.feature_is_angular[self.dset_key])[0]
+        # # Wrap around the correct range
+        # noised_vals[:, angular_idx] = utils.modulo_with_wrapped_range(
+        #     noised_vals[:, angular_idx], -np.pi, np.pi
+        # )
+        angular_idx = np.arange(noise.shape[-1])
+        # Wrap angles into correct range
+        if len(angular_idx) > 0:
+            noised_vals[:, angular_idx] = utils.modulo_with_wrapped_range(
+                noised_vals[:, angular_idx], -np.pi, np.pi
+            )
 
         retval = {
             "corrupted": noised_vals,

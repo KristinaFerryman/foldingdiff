@@ -5,6 +5,9 @@ Example usage: python ~/protdiff/bin/train.py ~/protdiff/config_jsons/full_run_c
 """
 
 import os, sys
+## This is just for loading the directory correctly
+# sys.path.insert(0, '/net/dali/home/mscbio/jih323/foldingdiff_seq/foldingdiff')
+
 import shutil
 import json
 import logging
@@ -135,7 +138,8 @@ def get_train_valid_test_sets(
 
     clean_dset_class = {
         "canonical": datasets.CathCanonicalAnglesDataset,
-        "canonical-full-angles": datasets.CathCanonicalAnglesOnlyDataset,
+        # "canonical-full-angles": datasets.CathCanonicalAnglesOnlyDataset,
+        "canonical-full-angles": datasets.CathCanonicalAnglesSequenceDataset,
         "canonical-minimal-angles": datasets.CathCanonicalMinimalAnglesDataset,
         "cart-coords": datasets.CathCanonicalCoordsDataset,
     }[angles_definitions]
@@ -184,7 +188,8 @@ def get_train_valid_test_sets(
     noised_dsets = [
         dset_noiser_class(
             dset=ds,
-            dset_key="coords" if angles_definitions == "cart-coords" else "angles",
+            # dset_key="coords" if angles_definitions == "cart-coords" else "angles",
+            dset_key="coords" if angles_definitions == "cart-coords" else ["angles","sequence"],    ## load both angles and sequence
             timesteps=timesteps,
             exhaustive_t=(i != 0) and exhaustive_t,
             beta_schedule=variance_schedule,
@@ -354,6 +359,7 @@ def train(
         variance_schedule=variance_schedule,
         var_scale=variance_scale,
         toy=subset,
+        # toy=True,
         syn_noiser=syn_noiser,
         exhaustive_t=exhaustive_validation_t,
         single_angle_debug=single_angle_debug,
@@ -434,13 +440,30 @@ def train(
         use_cache=False,
     )
     # ft_is_angular from the clean datasets angularity definition
-    ft_key = "coords" if angles_definitions == "cart-coords" else "angles"
+    # ft_key = "coords" if angles_definitions == "cart-coords" else "angles"
+    ft_key = "coords" if angles_definitions == "cart-coords" else ["angles", "sequence"]
+    ## aggregate the true features
+    if isinstance(ft_key, list):
+        ft_is_angular = []
+        ft_names = []
+        for key in ft_key:
+            feature_is_angular_key = dsets[0].dset.feature_is_angular[key]
+            feature_names_key = dsets[0].dset.feature_names[key]
+            ft_is_angular.extend([i for i in feature_is_angular_key if i])
+            # print(feature_is_angular[key], feature_names[key])
+            ft_names.extend([name for name, keep in zip(feature_names_key, feature_is_angular_key) if keep])
+    else:
+        ft_is_angular = dsets[0].dset.feature_is_angular[ft_key]
+        ft_names = dsets[0].dset.feature_names[ft_key]
+
     model = modelling.BertForDiffusion(
         config=cfg,
         time_encoding=time_encoding,
         decoder=decoder,
-        ft_is_angular=dsets[0].dset.feature_is_angular[ft_key],
-        ft_names=dsets[0].dset.feature_names[ft_key],
+        # ft_is_angular=dsets[0].dset.feature_is_angular[ft_key],
+        # ft_names=dsets[0].dset.feature_names[ft_key],
+        ft_is_angular=ft_is_angular,
+        ft_names=ft_names,
         lr=lr,
         loss=loss_fn,
         use_pairwise_dist_loss=use_pdist_loss
@@ -495,6 +518,10 @@ def train(
         train_dataloaders=train_dataloader,
         val_dataloaders=valid_dataloader,
     )
+    ## This is for debugging
+    # for i, batch in enumerate(train_dataloader):
+    #     # loss = model._get_loss_terms(batch)
+    #     loss = model.training_step(batch)
 
     # Plot the losses
     metrics_csv = os.path.join(
@@ -581,3 +608,22 @@ if __name__ == "__main__":
     )
 
     main()
+
+    ## toy example for testing datasets
+    # dsets = get_train_valid_test_sets(
+    #     dataset_key="cath",
+    #     angles_definitions="canonical-full-angles",
+    #     max_seq_len=512,
+    #     min_seq_len=0,
+    #     seq_trim_strategy="leftalign",
+    #     timesteps=250,
+    #     variance_schedule="linear",
+    #     var_scale=1.0,
+    #     toy=True,
+    #     syn_noiser="",
+    #     exhaustive_t=False,
+    #     single_angle_debug=-1,
+    #     single_time_debug=False,
+    #     train_only=True,
+    # )
+

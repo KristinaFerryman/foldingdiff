@@ -613,6 +613,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                 }
                 json.dump(d_to_write, f)
 
+        ## I'm not changing the following codes because I'm lazy
         if (
             isinstance(self.use_pairwise_dist_loss, (list, tuple))
             or self.use_pairwise_dist_loss > 0
@@ -924,7 +925,6 @@ class BertForAutoregressive(BertForAutoregressiveBase, pl.LightningModule):
         """
         # Get the predictions
         preds = self.forward(
-            batch["angles"],
             attention_mask=batch["causal_attn_mask"],
             seq_lengths=batch["lengths"],
             position_ids=batch["position_ids"],
