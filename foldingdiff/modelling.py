@@ -493,6 +493,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         self,
         lr: float = 5e-5,
         loss: Union[Callable, LOSS_KEYS] = "smooth_l1",
+        sequence_loss_weight: float = 3.0,
         use_pairwise_dist_loss: Union[float, Tuple[float, float, int]] = 0.0,
         l2: float = 0.0,
         l1: float = 0.0,
@@ -536,6 +537,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                 len(self.loss_func) == self.n_inputs
             ), f"Got {len(self.loss_func)} loss functions, expected {self.n_inputs}"
 
+        self.sequence_loss_weight = sequence_loss_weight
         self.use_pairwise_dist_loss = use_pairwise_dist_loss
         self.l1_lambda = l1
         self.l2_lambda = l2
@@ -602,6 +604,10 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                     known_noise[unmask_idx[0], unmask_idx[1], i],
                 )
             loss_terms.append(l)
+        ## reweight the loss terms
+        seq_feat_idx = self.ft_names.index('sequence')
+        ## upscale the sequence feature loss
+        loss_terms[seq_feat_idx] = self.sequence_loss_weight*loss_terms[seq_feat_idx]
 
         if write_preds is not None:
             with open(write_preds, "w") as f:
