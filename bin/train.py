@@ -317,6 +317,7 @@ def train(
     batch_size: int = 64,
     lr: float = 5e-5,  # Default lr for huggingface BERT trainer
     loss: modelling.LOSS_KEYS = "smooth_l1",
+    sequence_loss_weight: float = 3.0,
     use_pdist_loss: Union[
         float, Tuple[float, float]
     ] = 0.0,  # Use the pairwise distances between CAs as an additional loss term, multiplied by this scalar
@@ -402,18 +403,18 @@ def train(
     plots_folder = results_folder / "plots"
     os.makedirs(plots_folder, exist_ok=True)
     # Skip this for debug runs
-    if (
-        single_angle_debug < 0
-        and not single_timestep_debug
-        and not syn_noiser
-        and not dryrun
-    ):
-        plot_kl_divergence(dsets[0], plots_folder)
-        plot_timestep_distributions(
-            dsets[0],
-            timesteps=timesteps,
-            plots_folder=plots_folder,
-        )
+    # if (
+    #     single_angle_debug < 0
+    #     and not single_timestep_debug
+    #     and not syn_noiser
+    #     and not dryrun
+    # ):
+    #     plot_kl_divergence(dsets[0], plots_folder)
+    #     plot_timestep_distributions(
+    #         dsets[0],
+    #         timesteps=timesteps,
+    #         plots_folder=plots_folder,
+    #     )
 
     # https://jaketae.github.io/study/relative-positional-encoding/
     # looking at the relative distance between things is more robust
@@ -422,6 +423,7 @@ def train(
     if single_angle_debug > 0 or single_timestep_debug or syn_noiser:
         loss_fn = functools.partial(losses.radian_smooth_l1_loss, beta=0.1 * np.pi)
     logging.info(f"Using loss function: {loss_fn}")
+    logging.info(f"Sequence loss weight is set to {sequence_loss_weight}")
 
     # Shape of the input is (batch_size, timesteps, features)
     sample_input = dsets[0][0]["corrupted"]  # First item of the training dset
@@ -466,6 +468,7 @@ def train(
         ft_names=ft_names,
         lr=lr,
         loss=loss_fn,
+        sequence_loss_weight = sequence_loss_weight,
         use_pairwise_dist_loss=use_pdist_loss
         if isinstance(use_pdist_loss, float)
         else [*use_pdist_loss, timesteps],
