@@ -44,7 +44,8 @@ TRIM_STRATEGIES = Literal["leftalign", "randomcrop", "discard"]
 
 FEATURE_SET_NAMES_TO_ANGULARITY = {
     "canonical": [False, False, False, True, True, True, True, True, True],
-    "canonical-full-angles": [True, True, True, True, True, True],
+    # "canonical-full-angles": [True, True, True, True, True, True],
+    "canonical-full-angles": [True, True, True, True, True, True, True], ## add a seq dimension
     "canonical-minimal-angles": [True, True, True, True],
     "cart-coords": [False, False, False],
 }
@@ -114,6 +115,7 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
         zero_center: bool = True,  # Center the features to have 0 mean
         use_cache: bool = True,  # Use/build cached computations of dihedrals and angles
         cache_dir: Path = Path(os.path.dirname(os.path.abspath(__file__))),
+        cache_fn: str = None,
     ) -> None:
         super().__init__()
         assert pad > min_length
@@ -139,6 +141,14 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
         codebase_matches_hash = False
         self.use_cache = use_cache
         self.cache_dir = cache_dir
+
+        ## allow using user-defined cahce file
+        if use_cache:
+            if cache_fn is not None:
+                cache_fname = cache_fn
+            else:
+                cache_fname = self.cache_fname
+            print("Using cache file", cache_fname)
         # Always compute for toy; do not save
         if toy:
             if isinstance(toy, bool):
@@ -147,9 +157,9 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
 
             logging.info(f"Loading toy dataset of {toy} structures")
             self.structures = self.__compute_featurization(fnames)
-        elif use_cache and os.path.exists(self.cache_fname):
-            logging.info(f"Loading cached full dataset from {self.cache_fname}")
-            with open(self.cache_fname, "rb") as source:
+        elif use_cache and os.path.exists(cache_fname):
+            logging.info(f"Loading cached full dataset from {cache_fname}")
+            with open(cache_fname, "rb") as source:
                 loaded_hash, loaded_structures = pickle.load(source)
                 codebase_matches_hash = loaded_hash == codebase_hash
                 if not all("sequence" in s for s in loaded_structures):
@@ -157,6 +167,7 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
                     self.structures = None
                 elif not codebase_matches_hash:
                     logging.warning("Mismatched hashes between codebase and cached values; updating cached values")
+                    self.structures = loaded_structures
                 else:
                     self.structures = loaded_structures
                     logging.info("Hash matches between codebase and cached values!")
@@ -165,8 +176,8 @@ class CathCanonicalAnglesSequenceDataset(Dataset):
             self.__clean_mismatched_caches()
             self.structures = self.__compute_featurization(fnames)
             if use_cache and not codebase_matches_hash:
-                logging.info(f"Saving full dataset to cache at {self.cache_fname}")
-                with open(self.cache_fname, "wb") as sink:
+                logging.info(f"Saving full dataset to cache at {cache_fname}")
+                with open(cache_fname, "wb") as sink:
                     pickle.dump((codebase_hash, self.structures), sink)
 
         # If specified, remove sequences shorter than min_length
@@ -1040,13 +1051,15 @@ class AnglesEmptyDataset(Dataset):
     ):
         k = "coords" if feature_set_key == "cart-coords" else "angles"
         self.feature_is_angular = {k: FEATURE_SET_NAMES_TO_ANGULARITY[feature_set_key]}
-        self.feature_names = {k: FEATURE_SET_NAMES_TO_FEATURE_NAMES[feature_set_key]}
+        # self.feature_names = {k: FEATURE_SET_NAMES_TO_FEATURE_NAMES[feature_set_key]}
+        self.feature_names = {k: FEATURE_SET_NAMES_TO_FEATURE_NAMES[feature_set_key]+['sequence']}
         assert len(self.feature_names[k]) == len(self.feature_is_angular[k])
         logging.info(
             f"Angularity definitions: {self.feature_is_angular} | {self.feature_names}"
         )
         self.pad = pad
-        self._mean_offset = mean_offset
+        # self._mean_offset = mean_offset
+        self._mean_offset = np.append(mean_offset, 0)
         if self._mean_offset is not None:
             assert self._mean_offset.size == len(self.feature_names[k])
 

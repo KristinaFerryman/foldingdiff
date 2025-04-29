@@ -194,7 +194,8 @@ def sample(
             noise=noise,
             timesteps=train_dset.timesteps,
             betas=train_dset.alpha_beta_terms["betas"],
-            is_angle=train_dset.feature_is_angular[feature_key],
+            # is_angle=train_dset.feature_is_angular[feature_key],
+            is_angle=[True]*model.n_inputs,
             disable_pbar=disable_pbar,
         )
         # Gets to size (timesteps, seq_len, n_ft)
