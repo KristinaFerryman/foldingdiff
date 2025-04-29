@@ -6,7 +6,7 @@ Example usage: python ~/protdiff/bin/train.py ~/protdiff/config_jsons/full_run_c
 
 import os, sys
 ## This is just for loading the directory correctly
-# sys.path.insert(0, '/net/dali/home/mscbio/jih323/foldingdiff_seq/foldingdiff')
+sys.path.insert(0, '/net/dali/home/mscbio/jih323/foldingdiff_seq/foldingdiff')
 
 import shutil
 import json
@@ -126,6 +126,7 @@ def get_train_valid_test_sets(
     single_angle_debug: int = -1,  # Noise and return a single angle. -1 to disable, 1-3 for omega/theta/phi
     single_time_debug: bool = False,  # Noise and return a single time
     train_only: bool = False,
+    cache_fn: str = None,
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     Get the dataset objects to use for train/valid/test
@@ -156,6 +157,7 @@ def get_train_valid_test_sets(
             trim_strategy=seq_trim_strategy,
             zero_center=False if angles_definitions == "cart-coords" else True,
             toy=toy,
+            cache_fn=cache_fn,
         )
         for s in splits
     ]

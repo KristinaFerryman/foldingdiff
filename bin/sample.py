@@ -19,6 +19,8 @@ from astropy.visualization.mpl_normalize import ImageNormalize
 import torch
 from huggingface_hub import snapshot_download
 
+sys.path.insert(0, '/net/dali/home/mscbio/jih323/foldingdiff_seq/foldingdiff')
+
 # Import data loading code from main training script
 from train import get_train_valid_test_sets
 from annot_secondary_structures import make_ss_cooccurrence_plot
@@ -43,6 +45,7 @@ FT_NAME_MAP = {
     "tau": r"$\theta_1$",
     "CA:C:1N": r"$\theta_2$",
     "C:1N:1CA": r"$\theta_3$",
+    "sequence": "seq",
 }
 
 
@@ -296,7 +299,7 @@ def main() -> None:
     os.makedirs(args.outdir, exist_ok=True)
     outdir = Path(args.outdir)
     # Be extra cautious so we don't overwrite any results
-    assert not os.listdir(outdir), f"Expected {outdir} to be empty!"
+    # assert not os.listdir(outdir), f"Expected {outdir} to be empty!"
 
     # Download the model if it was given on modelhub
     if utils.is_huggingface_hub_id(args.model):
@@ -311,7 +314,7 @@ def main() -> None:
 
     # Load the dataset based on training args
     train_dset, _, test_dset = build_datasets(
-        Path(args.model), load_actual=args.testcomparison
+        Path(args.model), load_actual=args.testcomparison,
     )
     phi_idx = test_dset.feature_names["angles"].index("phi")
     psi_idx = test_dset.feature_names["angles"].index("psi")
@@ -356,7 +359,7 @@ def main() -> None:
         sweep_lengths=(sweep_min_len, sweep_max_len),
         batch_size=args.batchsize,
     )
-    final_sampled = [s[-1] for s in sampled]
+    final_sampled = [s[-1] for s in sampled]    ## (1000,50,7)->(50,7)
     sampled_dfs = [
         pd.DataFrame(s, columns=train_dset.feature_names["angles"])
         for s in final_sampled
@@ -369,7 +372,8 @@ def main() -> None:
     for i, s in enumerate(sampled_dfs):
         s.to_csv(sampled_angles_folder / f"generated_{i}.csv.gz")
     # Write the sampled angles as pdb files
-    pdb_files = write_preds_pdb_folder(sampled_dfs, outdir / "sampled_pdb")
+    # pdb_files = write_preds_pdb_folder(sampled_dfs, outdir / "sampled_pdb")
+    # pdb_files = write_preds_pdb_folder(sampled_dfs.iloc[:,:-1], outdir / "sampled_pdb")
 
     # If full history is specified, create a separate directory and write those files
     if args.fullhistory:
@@ -400,10 +404,10 @@ def main() -> None:
     # Generate histograms of sampled angles -- separate plots, and a combined plot
     # For calculating angle distributions
     multi_fig, multi_axes = plt.subplots(
-        dpi=300, nrows=2, ncols=3, figsize=(14, 6), sharex=True
+        dpi=300, nrows=2, ncols=4, figsize=(14, 6), sharex=True
     )
     step_multi_fig, step_multi_axes = plt.subplots(
-        dpi=300, nrows=2, ncols=3, figsize=(14, 6), sharex=True
+        dpi=300, nrows=2, ncols=4, figsize=(14, 6), sharex=True
     )
     final_sampled_stacked = np.vstack(final_sampled)
     for i, ft_name in enumerate(test_dset.feature_names["angles"]):
@@ -454,19 +458,21 @@ def main() -> None:
     )
 
     # Generate plots of secondary structure co-occurrence
-    if not args.nopsea:
-        make_ss_cooccurrence_plot(
-            pdb_files,
-            str(outdir / "plots" / "ss_cooccurrence_sampled.pdf"),
-            threads=multiprocessing.cpu_count(),
-        )
-        if args.testcomparison:
-            make_ss_cooccurrence_plot(
-                test_dset.filenames,
-                str(outdir / "plots" / "ss_cooccurrence_test.pdf"),
-                max_seq_len=test_dset.dset.pad,
-                threads=multiprocessing.cpu_count(),
-            )
+    # if not args.nopsea:
+    #     make_ss_cooccurrence_plot(
+    #         pdb_files,
+    #         str(outdir / "plots" / "ss_cooccurrence_sampled.pdf"),
+    #         threads=multiprocessing.cpu_count(),
+    #     )
+    #     if args.testcomparison:
+    #         make_ss_cooccurrence_plot(
+    #             test_dset.filenames,
+    #             str(outdir / "plots" / "ss_cooccurrence_test.pdf"),
+    #             max_seq_len=test_dset.dset.pad,
+    #             threads=multiprocessing.cpu_count(),
+    #         )
+
+
 
 
 if __name__ == "__main__":
